@@ -103,7 +103,7 @@ class Attention(Layer):
         return self.wo(output)
 
 
-class TransformerBlock(Layer):
+class LlamaBlock(Layer):
     def __init__(
         self, n_heads: int, norm_eps: float = 1e-6, **layer_kwargs: BaseLayerKwargs
     ):
@@ -135,7 +135,7 @@ def precompute_cos_sin(seq_len: int, dim: int, dtype, base: int = 10_000):
     return cos, sin
 
 
-class Transformer(Model):
+class Llama(Model):
     def __init__(
         self,
         vocab_size: int,
@@ -151,7 +151,7 @@ class Transformer(Model):
             input_dim=vocab_size, output_dim=dim, name="token_embeddings"
         )
         self.blocks = [
-            TransformerBlock(n_heads=n_heads, norm_eps=norm_eps, **layer_kwargs)
+            LlamaBlock(n_heads=n_heads, norm_eps=norm_eps, **layer_kwargs)
             for _ in range(n_layers)
         ]
         self.norm = RMSNorm(eps=norm_eps)
@@ -161,12 +161,12 @@ class Transformer(Model):
         )
 
     def call(self, inputs, training=False):
-        _bsz, seqlen = inputs.shape
+        _bsz, seq_len = inputs.shape
         h = self.tok_embeddings(inputs)
-        cos = ops.cast(self.cos_cached[:, :seqlen], dtype=h.dtype)
-        sin = ops.cast(self.sin_cached[:, :seqlen], dtype=h.dtype)
+        cos = ops.cast(self.cos_cached[:, :seq_len], dtype=h.dtype)
+        sin = ops.cast(self.sin_cached[:, :seq_len], dtype=h.dtype)
 
-        mask = ops.full((1, 1, seqlen, seqlen), fill_value=-1e10)
+        mask = ops.full((1, 1, seq_len, seq_len), fill_value=-1e10)
         mask = ops.triu(mask, k=1)
 
         for block in self.blocks:
@@ -177,26 +177,97 @@ class Transformer(Model):
 
 
 if __name__ == "__main__":
-    model = Transformer(
-        vocab_size=2**10,
-        max_seq_len=128,
+    import wandb
+    from keras_core.utils import PyDataset, plot_model, set_random_seed
+    from wandb.keras import WandbCallback, WandbMetricsLogger, WandbModelCheckpoint
+
+    set_random_seed(1)
+
+    class TinyShakespeare(PyDataset):
+        def __init__(self, seq_len, batch_size, is_val, **kwargs):
+            super().__init__(**kwargs)
+            with open("tinyshakespeare.txt", "r", encoding="utf-8") as input_f:
+                text = input_f.read()
+            self.vocab = sorted(list(set(text)))
+            self.char_to_idx = {ch: i for i, ch in enumerate(self.vocab)}
+            text = ops.array(self.encode(text), dtype="int8")
+            if not is_val:
+                self.text = text[: int(0.8 * len(text))]
+            else:
+                self.text = text[int(0.8 * len(text)) :]
+            self.seq_len = seq_len
+            self.batch_size = batch_size
+
+        def __len__(self):
+            return len(self.text) // self.batch_size
+
+        def __getitem__(self, idx: int):
+            low = idx * self.batch_size
+            high = min(low + self.batch_size, len(self.text) - 1)
+            x = ops.stack([self.text[i : i + self.seq_len] for i in range(low, high)])
+            y = ops.stack(
+                [self.text[i + 1 : i + self.seq_len + 1] for i in range(low, high)]
+            )
+            return x, y
+
+        def encode(self, text: str):
+            return [self.char_to_idx[ch] for ch in text]
+
+        def decode(self, ids):
+            return "".join(self.vocab[i] for i in ids)
+
+    config = dict(
+        seq_len=16,
         n_layers=4,
-        dim=384,
+        dim=128,
         n_heads=8,
         norm_eps=1e-7,
+        epoch=1000,
+        batch_size=8,
+    )
+    dataset = TinyShakespeare(
+        seq_len=config["seq_len"], batch_size=config["batch_size"], is_val=False
+    )
+    validation_dataset = TinyShakespeare(
+        seq_len=config["seq_len"], batch_size=config["batch_size"], is_val=True
+    )
+    # print([(dataset.decode(x), dataset.decode(y)) for x, y in zip(*dataset[0])])
+    # print(dataset.decode(dataset.encode("hello")))
+    config["vocab_size"] = len(dataset.vocab)
+
+    wandb.init(
+        project="my-gpt",
+        config=config,
+        name="base",
+        notes="Baseline",
+        tags=["baseline"],
+        anonymous="allow",
+        dir="logs",
+    )
+
+    model = Llama(
+        vocab_size=config["vocab_size"],
+        max_seq_len=config["seq_len"],
+        n_layers=config["n_layers"],
+        dim=config["dim"],
+        n_heads=config["n_heads"],
+        norm_eps=config["norm_eps"],
     )
     model.compile(
-        optimizer=keras.optimizers.AdamW(),
-        loss=keras.losses.SparseCategoricalCrossentropy(),
+        optimizer="adam",
+        loss="sparse_categorical_crossentropy",
         metrics=[keras.metrics.SparseTopKCategoricalAccuracy()],
     )
-
-    class MyDataset(keras.utils.PyDataset):
-        def __len__(self):
-            return 2**14
-
-        def __getitem__(self, idx):
-            return ops.array([[idx % 1024]]), ops.array([[(idx + 1) % 1024]])
-
-    model.fit(MyDataset(), epochs=2, batch_size=256)
+    model(dataset[0][0])
     model.summary()
+    model.fit(
+        dataset,
+        epochs=10,
+        verbose=1,
+        callbacks=[
+            WandbCallback(log_batch_frequency=100, compute_flops=True),
+            WandbMetricsLogger(),
+            WandbModelCheckpoint(filepath="model-{epoch:02d}-{val_loss:.2f}"),
+        ],
+        validation_data=validation_dataset,
+    )
